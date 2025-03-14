@@ -1,0 +1,281 @@
+- name: System setup
+  hosts: techzone
+  tasks:
+    - name: Ping my host
+      ansible.builtin.ping:
+    
+    - name: Create working directory
+      ansible.builtin.file:
+        path: "{{ working_directory }}"
+        state: directory
+        owner: "{{ ansible_user }}"
+        mode: 0775
+        recurse: yes
+
+    - name: Get RHEL version
+      ansible.builtin.shell: rpm -E %rhel
+      register: rhel_version
+
+    - name: Print RHEL version
+      ansible.builtin.debug:
+        msg: "RHEL version: {{ rhel_version.stdout }}"
+
+    - rpm_key:
+        state: present
+        key: "https://dl.fedoraproject.org/pub/epel/RPM-GPG-KEY-EPEL-{{ rhel_version.stdout }}"
+      become: true
+      become_user: root
+
+    - name: Install enterprise package
+      become: true
+      become_user: root
+      dnf:
+        name:
+          - dnf-plugins-core
+          - "https://dl.fedoraproject.org/pub/epel/epel-release-latest-{{ rhel_version.stdout }}.noarch.rpm"
+        state: latest
+
+    - name: Enable powertools/codeready builder for RHEL (powertools under CentOS)
+      become: true
+      become_user: root
+      command: subscription-manager repos --enable codeready-builder-for-rhel-{{ rhel_version.stdout }}-ppc64le-rpms
+
+    - name: Install the 'Development tools' package group
+      become: true
+      become_user: root
+      dnf:
+        name: '@Development tools'
+        state: present
+    
+    - name: Install further system dependencies
+      become: true
+      become_user: root
+      dnf:
+        name:
+          - bzip2
+          - cmake
+          - gcc-toolset-13
+          - git
+          - openblas-devel
+        state: latest
+    
+- name: Micromamba setup
+  hosts: techzone
+  tasks:
+    - name: "Check if micromamba already exists in {{ micromamba_location }}"
+      ansible.builtin.stat:
+        path: "{{ micromamba_location }}"
+      register: dest_stat
+
+    - name: Install micromamba
+      ansible.builtin.import_tasks: download-and-extract-micromamba.yml
+      when: not dest_stat.stat.exists
+    
+    - name: Install basic Python dependencies
+      ansible.builtin.command:
+        argv:
+          - micromamba
+          - install
+          - --yes
+          - "--root-prefix={{ conda_dir }}"
+          - "--prefix={{ conda_dir }}"
+          - --channel=rocketce
+          - --channel=defaults
+          - "python={{ python_version }}"
+          - fastapi
+          - numpy
+          - pytorch-cpu
+          - sentencepiece
+          - uvicorn
+          - "conda-forge::gguf"
+
+    - name: Install backend-specific Python dependencies
+      ansible.builtin.shell: |
+        python{{ python_version }} -m pip install -U \
+          loguru \
+          openai;
+  vars:
+    arch: linux-ppc64le
+    version: latest
+
+- name: Backend setup
+  hosts: techzone
+  tasks:
+    - name: Populate service facts
+      service_facts:
+
+    - name: Stop already existing llama.cpp service
+      ansible.builtin.systemd_service:
+        state: stopped
+        name: llama.cpp
+      become: true
+      become_user: root
+      when: "'llama.cpp.service' in services"
+
+    - name: Stop already existing backend service
+      ansible.builtin.systemd_service:
+        state: stopped
+        name: entity-extraction-backend
+      become: true
+      become_user: root
+      when: "'entity-extraction-backend.service' in services"
+
+    - name: Clone llama.cpp repository
+      git:
+       repo: https://github.com/ggerganov/llama.cpp.git
+       dest: "{{ working_directory }}/llama.cpp"
+       clone: yes
+       force: true
+       update: yes
+    
+    - name: Create build directory
+      ansible.builtin.file:
+        path: "{{ working_directory }}/llama.cpp/build"
+        state: directory
+        owner: "{{ ansible_user }}"
+        mode: 0775
+        recurse: yes
+
+    - name: Build llama.cpp with optimizations
+      ansible.builtin.shell: |
+        cmake -DGGML_BLAS=ON -DGGML_BLAS_VENDOR=OpenBLAS ..;
+        cmake --build . --config Release -j 8;
+      args:
+        chdir: "{{ working_directory }}/llama.cpp/build"
+      environment:
+        PATH: "/opt/rh/gcc-toolset-13/root/usr/bin:{{ ansible_env.PATH }}"
+
+    - name: Make server binary executable
+      ansible.builtin.file:
+        path: "{{ working_directory }}/llama.cpp/build/bin/llama-server"
+        owner: "{{ ansible_user }}"
+        mode: 0777
+    
+    - name: Install huggingface-cli
+      ansible.builtin.shell: |
+        python{{ python_version }} -m pip install -U "huggingface_hub[cli]"
+
+    - name: Populate model path
+      ansible.builtin.set_fact:
+        model_path: "{{ working_directory }}/models/{{ model_repository }}"
+
+    - name: Check if model file already exists
+      ansible.builtin.stat:
+        path: "{{ model_path }}"
+      register: model_result
+        
+    - name: Download LLM
+      ansible.builtin.shell: |
+        huggingface-cli download \
+          {{ model_repository }} {{ model_file }} \
+          --local-dir {{ model_path }}
+      when: not model_result.stat.exists
+    
+    - name: Build llama.cpp parameter list (-)
+      ansible.builtin.set_fact:
+        llama_cpp_args: >-
+          {% set result = [] -%}
+          {% for key in llama_cpp_args.keys() -%}
+            {% set ignored = result.extend(["-" + key, llama_cpp_args[key] or ""]) -%}
+          {%- endfor %}
+          {{ result | join(" ") }}
+      when: llama_cpp_args is defined
+
+    - name: Build llama.cpp parameter list (--)
+      ansible.builtin.set_fact:
+        llama_cpp_argv: >-
+          {% set result = [] -%}
+          {% for key in llama_cpp_argv.keys() -%}
+            {% set ignored = result.extend(["--" + key, llama_cpp_argv[key] or ""]) -%}
+          {%- endfor %}
+          {{ result | join(" ") }}
+      when: llama_cpp_argv is defined
+
+    - name: Default llama.cpp parameter list (-)
+      ansible.builtin.set_fact:
+        llama_cpp_args: ""
+      when: llama_cpp_args is not defined
+
+    - name: Default llama.cpp parameter list (--)
+      ansible.builtin.set_fact:
+        llama_cpp_argv: "--host 0.0.0.0 --port 8080"
+      when: llama_cpp_argv is not defined
+
+    - name: Print parameter lists
+      ansible.builtin.debug:
+        msg: "Parameters: {{ llama_cpp_args }} {{ llama_cpp_argv }}"
+
+    - name: Copy systemd service templates
+      become: true
+      become_user: root
+      ansible.builtin.copy:
+        src: template.service
+        dest: "{{ item }}"
+        owner: "{{ ansible_user }}"
+        mode: u=rw,g=r,o=rwx
+      loop:
+        - /etc/systemd/system/llama.cpp.service
+        - /etc/systemd/system/entity-extraction-backend.service
+
+    - name: Insert service information into llama.cpp service file
+      become: true
+      become_user: root
+      ansible.builtin.lineinfile:
+        path: /etc/systemd/system/llama.cpp.service
+        regexp: "{{ item.regexp }}"
+        line: "{{ item.line }}"
+        backrefs: yes
+      loop:
+        - { regexp: "^Description=(.*)$", line: "Description=Llama.cpp Service" }
+        - { regexp: "^ExecStart=(.*)$", line: "ExecStart={{ working_directory }}/llama.cpp/build/bin/llama-server -m {{ working_directory }}/models/{{ model_repository }}/{{ model_file }} {{ llama_cpp_args }} {{ llama_cpp_argv }}" }
+        - { regexp: "^User=(.*)$", line: "User={{ ansible_user }}" }
+
+    - name: Copy backend-related files
+      ansible.builtin.copy:
+        src: "{{ item.src }}"
+        dest: "{{ item.dest }}"
+        owner: "{{ ansible_user }}"
+        mode: u=rw,g=r,o=rwx
+      loop:
+        - { src: "../src/backend.py", dest: "{{ working_directory }}/backend.py" }
+        - { src: "../src/utils.py", dest: "{{ working_directory }}/utils.py" }
+
+    - name: Build backend service parameter list
+      ansible.builtin.set_fact:
+        backend_parameters: >-
+          {% set result = [] -%}
+          {% for key in backend_argv.keys() -%}
+            {% set ignored = result.extend(["--" + key, backend_argv[key] or ""]) -%}
+          {%- endfor %}
+          {{ result | join(" ") }}
+
+    - name: Insert service information into backend service file
+      become: true
+      become_user: root
+      ansible.builtin.lineinfile:
+        path: /etc/systemd/system/entity-extraction-backend.service
+        regexp: "{{ item.regexp }}"
+        line: "{{ item.line }}"
+        backrefs: yes
+      loop:
+        - { regexp: "^Description=(.*)$", line: "Description=Entity Extraction Backend Service" }
+        - { regexp: "^ExecStart=(.*)$", line: "ExecStart={{ conda_dir }}/bin/python {{ working_directory }}/backend.py {{ backend_parameters }}" }
+        - { regexp: "^User=(.*)$", line: "User={{ ansible_user }}" }
+
+    - name: Start backend services
+      become: true
+      become_user: root
+      ansible.builtin.systemd_service:
+        state: started
+        daemon_reload: true
+        name: "{{ item }}"
+      loop:
+        - llama.cpp
+        - entity-extraction-backend
+
+- name: Frontend setup
+  hosts: techzone
+  tasks:
+    - name: Setup frontend
+      ansible.builtin.import_tasks: frontend-setup.yml
+      when: update_frontend

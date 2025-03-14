@@ -1,0 +1,93 @@
+- name: Populate service facts
+  service_facts:
+
+- name: Stop already existing frontend service
+  ansible.builtin.systemd_service:
+    state: stopped
+    name: entity-extraction-frontend
+  become: true
+  become_user: root
+  when: "'entity-extraction-frontend.service' in services"
+
+- name: Define micromamba prefix directory for the frontend
+  ansible.builtin.set_fact:
+    frontend_prefix: "/home/{{ ansible_user }}/frontend"
+    cacheable: yes
+
+- name: Create prefix directory for frontend environment
+  ansible.builtin.file:
+    path: "{{ frontend_prefix }}"
+    state: directory
+    owner: "{{ ansible_user }}"
+    mode: 0775
+    recurse: yes
+
+- name: Create environment and install basic dependencies
+  ansible.builtin.command:
+    argv:
+    - micromamba
+    - install
+    - --yes
+    - "--root-prefix={{ frontend_prefix }}"
+    - "--prefix={{ frontend_prefix }}"
+    - --channel=rocketce
+    - --channel=defaults
+    - "python={{ python_version }}"
+    - fastapi
+    - numpy
+    - pillow
+    - uvicorn
+
+- name: Install gradio and its dependencies
+  ansible.builtin.shell: |
+    {{ frontend_prefix }}/bin/python -m pip install \
+      gradio;
+
+- name: Copy frontend-related files
+  ansible.builtin.copy:
+    src: "{{ item.src }}"
+    dest: "{{ item.dest }}"
+    owner: "{{ ansible_user }}"
+    mode: u=rw,g=r,o=rwx
+  loop:
+    - { src: "../src/frontend.py", dest: "{{ working_directory }}/frontend.py" }
+    - { src: "../src/ibm_theme.py", dest: "{{ working_directory }}/ibm_theme.py" }
+
+- name: Copy systemd service template for frontend
+  ansible.builtin.copy:
+    src: template.service
+    dest: /etc/systemd/system/entity-extraction-frontend.service
+    owner: "{{ ansible_user }}"
+    mode: u=rw,g=r,o=rwx
+  become: true
+  become_user: root
+
+- name: Build frontend service parameter list
+  ansible.builtin.set_fact:
+    frontend_parameters: >-
+      {% set result = [] -%}
+      {% for key in frontend_argv.keys() -%}
+        {% set ignored = result.extend(["--" + key, frontend_argv[key] or ""]) -%}
+      {%- endfor %}
+      {{ result | join(" ") }}
+
+- name: Insert service information into frontend service file
+  become: true
+  become_user: root
+  ansible.builtin.lineinfile:
+    path: /etc/systemd/system/entity-extraction-frontend.service
+    regexp: "{{ item.regexp }}"
+    line: "{{ item.line }}"
+    backrefs: yes
+  loop:
+    - { regexp: "^Description=(.*)$", line: "Description=Entity Extraction Frontend Service" }
+    - { regexp: "^ExecStart=(.*)$", line: "ExecStart={{ frontend_prefix }}/bin/python {{ working_directory }}/frontend.py {{ frontend_parameters }}" }
+    - { regexp: "^User=(.*)$", line: "User={{ ansible_user }}" }
+
+- name: Set frontend service state
+  ansible.builtin.systemd_service:
+    state: "{{ frontend_state | default('started') }}"
+    daemon_reload: true
+    name: entity-extraction-frontend
+  become: true
+  become_user: root
