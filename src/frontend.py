@@ -42,7 +42,7 @@ def get_job(url: str, job_id: str) -> str:
     if "result" in response:
         try:
             result_object = ast.literal_eval(response["result"])
-        except ValueError:
+        except ValueError | SyntaxError:
             result_object = response["result"]
         response["result"] = result_object
 
